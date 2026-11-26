@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
@@ -36,7 +37,7 @@ class ThumbnailHomePage extends StatefulWidget {
 
 class _ThumbnailHomePageState extends State<ThumbnailHomePage> {
   File? _selectedImage;
-  String? _generatedImageUrl;
+  Uint8List? _generatedImageBytes;
   bool _isLoading = false;
 
   String _selectedCategory = 'News & Updates';
@@ -48,22 +49,29 @@ class _ThumbnailHomePageState extends State<ThumbnailHomePage> {
     'Gaming & Mass',
   ];
 
+  final TextEditingController _apiKeyController = TextEditingController();
   final TextEditingController _titleController = TextEditingController();
   final ImagePicker _picker = ImagePicker();
-
-  final String _apiEndpoint = 'https://YOUR-BACKEND-URL/generate-thumbnail';
 
   Future<void> _pickImage() async {
     final XFile? picked = await _picker.pickImage(source: ImageSource.gallery);
     if (picked != null) {
       setState(() {
         _selectedImage = File(picked.path);
-        _generatedImageUrl = null;
+        _generatedImageBytes = null;
       });
     }
   }
 
   Future<void> _generateThumbnail() async {
+    final apiKey = _apiKeyController.text.trim();
+    if (apiKey.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please enter your Gemini API Key first!')),
+      );
+      return;
+    }
+
     if (_selectedImage == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please select a photo first!')),
@@ -73,35 +81,76 @@ class _ThumbnailHomePageState extends State<ThumbnailHomePage> {
 
     setState(() {
       _isLoading = true;
+      _generatedImageBytes = null;
     });
 
     try {
       final bytes = await _selectedImage!.readAsBytes();
       final base64Image = base64Encode(bytes);
+      final headline = _titleController.text.trim();
+
+      final prompt =
+          'Create a high-click-through-rate 16:9 YouTube thumbnail using the person/subject from this image. '
+          'Keep the person\'s face and identity exactly the same. '
+          'Style/Category: $_selectedCategory. '
+          '${headline.isNotEmpty ? 'Add bold, eye-catching 3D thumbnail text: "$headline". ' : ''}'
+          'Use dramatic studio lighting, vibrant background, high contrast, and professional YouTube thumbnail composition.';
+
+      final url = Uri.parse(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:generateContent?key=$apiKey',
+      );
 
       final response = await http.post(
-        Uri.parse(_apiEndpoint),
+        url,
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
-          'image_base64': base64Image,
-          'category': _selectedCategory,
-          'headline': _titleController.text.trim(),
-          'aspect_ratio': '16:9',
+          'contents': [
+            {
+              'parts': [
+                {'text': prompt},
+                {
+                  'inlineData': {
+                    'mimeType': 'image/jpeg',
+                    'data': base64Image,
+                  }
+                }
+              ]
+            }
+          ],
+          'generationConfig': {
+            'responseModalities': ['TEXT', 'IMAGE'],
+          }
         }),
       );
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
-        setState(() {
-          _generatedImageUrl = data['thumbnail_url'];
-        });
+        final parts = data['candidates']?[0]?['content']?['parts'] as List?;
+        Uint8List? imageBytes;
+
+        if (parts != null) {
+          for (final part in parts) {
+            if (part['inlineData'] != null && part['inlineData']['data'] != null) {
+              imageBytes = base64Decode(part['inlineData']['data']);
+              break;
+            }
+          }
+        }
+
+        if (imageBytes != null) {
+          setState(() {
+            _generatedImageBytes = imageBytes;
+          });
+        } else {
+          throw Exception('No image returned by Gemini. Try again.');
+        }
       } else {
-        throw Exception('Server error: ${response.statusCode}');
+        throw Exception('API Error ${response.statusCode}: ${response.body}');
       }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to generate thumbnail: $e')),
+          SnackBar(content: Text('Error: $e')),
         );
       }
     } finally {
@@ -125,6 +174,16 @@ class _ThumbnailHomePageState extends State<ThumbnailHomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            TextField(
+              controller: _apiKeyController,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: 'Gemini API Key (AIza...)',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.key),
+              ),
+            ),
+            const SizedBox(height: 16),
             GestureDetector(
               onTap: _pickImage,
               child: Container(
@@ -190,7 +249,7 @@ class _ThumbnailHomePageState extends State<ThumbnailHomePage> {
               ),
             ),
             const SizedBox(height: 24),
-            if (_generatedImageUrl != null) ...[
+            if (_generatedImageBytes != null) ...[
               const Text(
                 'Generated Thumbnail:',
                 style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
@@ -200,7 +259,7 @@ class _ThumbnailHomePageState extends State<ThumbnailHomePage> {
                 aspectRatio: 16 / 9,
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(12),
-                  child: Image.network(_generatedImageUrl!, fit: BoxFit.cover),
+                  child: Image.memory(_generatedImageBytes!, fit: BoxFit.cover),
                 ),
               ),
             ],
